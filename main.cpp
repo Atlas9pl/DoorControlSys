@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <SPI.h>
 #include <MFRC522.h>
@@ -5,7 +6,7 @@
 #include <Keypad.h>
 #include <ESP32Servo.h>
 #include <time.h>
-#include <TOTP.h> // Ensure you add this in the Library Manager
+#include <TOTP.h> 
 
 // ==========================================
 // PIN DEFINITIONS & HARDWARE SETUP
@@ -48,10 +49,10 @@ TOTP totp = TOTP(hmacKey, 10);
 enum SystemState { STATE_IDLE, STATE_KEYPAD, STATE_UNLOCK };
 SystemState currentState = STATE_IDLE;
 
-const char* ssid = "Wokwi-GUEST"; 
-const char* password = "";
+const char* ssid = "YOUR_WIFI_NAME"; 
+const char* password = "YOUR_WIFI_PASSWORD";
 
-// INCREASED TO 6 DIGITS (7 characters including null terminator)
+// EXPECTS 6 DIGITS (7 characters including null terminator)
 char expectedOTP[7] = "000000";       
 const char masterPIN[7] = "123456";   
 char enteredPIN[7];                 
@@ -60,6 +61,17 @@ byte inputIndex = 0;
 unsigned long unlockStartTime = 0;
 const unsigned long UNLOCK_DURATION = 5000;
 bool justEnteredUnlock = false;
+
+// ==========================================
+// FUNCTION PROTOTYPES (CRITICAL FOR PLATFORMIO)
+// ==========================================
+void handleIdleState();
+void handleKeypadState();
+void handleUnlockState();
+void lcdPrint(const char* line1, const char* line2);
+void updateIdleLCD();
+void resetKeypadInput();
+void beep(int duration);
 
 // ==========================================
 // SETUP
@@ -88,7 +100,7 @@ void setup() {
   }
   Serial.println("\nWiFi Connected!");
 
-  // Enforce strict UTC Timezone to prevent Wokwi/ESP32 from using Local Time
+  // Enforce strict UTC Timezone 
   setenv("TZ", "UTC0", 1);
   tzset();
 
@@ -123,7 +135,7 @@ void handleIdleState() {
     time_t now;
     time(&now);
     
-    // DEBUG: Print the Unix Timestamp so we can verify Wokwi's time
+    // DEBUG: Print the Unix Timestamp
     Serial.print("Current UTC Unix Time: ");
     Serial.println((long)now);
     
@@ -193,7 +205,11 @@ void handleUnlockState() {
 }
 
 void lcdPrint(const char* line1, const char* line2) {
-  lcd.clear(); lcd.setCursor(0, 0); lcd.print(line1); lcd.setCursor(0, 1); lcd.print(line2);
+  lcd.clear(); 
+  lcd.setCursor(0, 0); 
+  lcd.print(line1); 
+  lcd.setCursor(0, 1); 
+  lcd.print(line2);
 }
 
 void updateIdleLCD() {
@@ -202,9 +218,12 @@ void updateIdleLCD() {
 }
 
 void resetKeypadInput() {
-  inputIndex = 0; memset(enteredPIN, 0, sizeof(enteredPIN));
+  inputIndex = 0; 
+  memset(enteredPIN, 0, sizeof(enteredPIN));
 }
 
 void beep(int duration) {
-  digitalWrite(BUZZER_PIN, HIGH); delay(duration); digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BUZZER_PIN, HIGH); 
+  delay(duration); 
+  digitalWrite(BUZZER_PIN, LOW);
 }
