@@ -5,6 +5,7 @@
 #include <LiquidCrystal.h>
 #include <Keypad.h>
 #include <ESP32Servo.h>
+#include <WebServer.h>
 #include <time.h>
 #include <TOTP.h> 
 
@@ -19,15 +20,16 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 LiquidCrystal lcd(22, 21, 17, 16, 2, 15);
 
 const byte ROWS = 4;
-const byte COLS = 3;
+const byte COLS = 4;
 char keys[ROWS][COLS] = {
-  {'1','2','3'},
-  {'4','5','6'},
-  {'7','8','9'},
-  {'*','0','#'}
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
 };
 byte rowPins[ROWS] = {13, 12, 14, 27};
-byte colPins[COLS] = {26, 25, 4}; // Replaced missing Pin 0 with newly freed Pin 4
+// WARNING: GPIO0 affects boot mode on ESP32. Ensure proper pull state in hardware.
+byte colPins[COLS] = {26, 25, 4, 0};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 const int SERVO_PIN = 32;
@@ -46,16 +48,35 @@ const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
 const unsigned long TIME_SYNC_RETRY_INTERVAL_MS = 60000;
 const long TOTP_STEP_SECONDS = 30;
 const int8_t TOTP_ACCEPT_WINDOW_STEPS = 1;
+const unsigned long TOTP_LCD_REFRESH_INTERVAL_MS = 250;
+const unsigned long OTP_ENTRY_TIMEOUT_MS = 60000;
+const unsigned long WEB_STATUS_REFRESH_MS = 2000;
 
-// The Hex equivalent of the Base32 secret "GEZDGNBVGY3TQOJQ"
-uint8_t hmacKey[] = {0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30};
-TOTP totp = TOTP(hmacKey, 10);
+struct CardProfile {
+  byte uid[4];
+  uint8_t secret[10];
+};
+
+const size_t CARD_UID_LEN = 4;
+const size_t CARD_SECRET_LEN = 10;
+
+// Pre-generated whitelist and per-card TOTP secrets.
+const CardProfile whitelist[] = {
+  {{0x9A, 0x89, 0x89, 0x81}, {0x31, 0x41, 0x73, 0x58, 0x39, 0x50, 0x62, 0x4B, 0x37, 0x51}},
+  {{0x45, 0xDC, 0x9A, 0x03}, {0x32, 0x4D, 0x68, 0x59, 0x38, 0x4E, 0x74, 0x43, 0x36, 0x57}},
+  {{0xA7, 0xA5, 0xB5, 0xB4}, {0x33, 0x52, 0x66, 0x56, 0x37, 0x4C, 0x79, 0x44, 0x35, 0x45}},
+  {{0x60, 0xB9, 0xC1, 0x1C}, {0x34, 0x54, 0x67, 0x4E, 0x36, 0x58, 0x71, 0x48, 0x39, 0x4A}},
+  {{0x0A, 0xCA, 0x9B, 0x03}, {0x35, 0x4B, 0x78, 0x50, 0x39, 0x53, 0x64, 0x46, 0x32, 0x4D}}
+};
+const size_t WHITELIST_COUNT = sizeof(whitelist) / sizeof(whitelist[0]);
 
 enum SystemState { STATE_IDLE, STATE_KEYPAD, STATE_UNLOCK };
 SystemState currentState = STATE_IDLE;
 
 const char* ssid = "Atlas"; 
 const char* password = "Zappy454";
+
+WebServer webServer(80);
 
 // EXPECTS 6 DIGITS (7 characters including null terminator)
 char expectedOTP[7] = "000000";       
@@ -70,6 +91,16 @@ bool timeSynced = false;
 bool useTOTPAuth = false;
 unsigned long lastWiFiRetryMs = 0;
 unsigned long lastTimeSyncRetryMs = 0;
+unsigned long lastTotpLcdRefreshMs = 0;
+uint8_t lastTotpSecondsShown = 255;
+int activeCardIndex = -1;
+unsigned long keypadEntryStartMs = 0;
+
+const uint8_t EVENT_LOG_SIZE = 20;
+const uint8_t EVENT_MSG_LEN = 64;
+char eventLog[EVENT_LOG_SIZE][EVENT_MSG_LEN];
+uint8_t eventLogHead = 0;
+uint8_t eventLogCount = 0;
 
 // ==========================================
 // FUNCTION PROTOTYPES (CRITICAL FOR PLATFORMIO)
@@ -84,6 +115,22 @@ void beep(int duration);
 bool syncTimeFromNTP();
 bool isValidOnlineOTP(const char* pin);
 void maintainWiFiAndTime();
+void updateTotpCountdownDisplay();
+void updateKeypadSessionDisplay();
+int findWhitelistedCardIndex(const byte* uid, byte uidSize);
+bool getCardTotpCodeAtTime(int cardIndex, long unixTime, char* outCode, size_t outCodeSize);
+void printUidHex(const byte* uid, byte uidSize);
+void logEvent(const char* message);
+void startWebDashboard();
+void handleWebRoot();
+void handleWebStatus();
+void handleWebEvents();
+void handleWebAction();
+const char* getStateLabel();
+int getTotpSecondsRemaining();
+int getKeypadSecondsRemaining();
+void appendUidToString(String& out, const byte* uid, byte uidSize);
+void resetRFIDSession();
 
 // ==========================================
 // SETUP
@@ -114,8 +161,12 @@ void setup() {
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi Connected!");
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+    logEvent("WiFi connected");
   } else {
     Serial.println("\nWiFi not connected. Continuing in offline mode.");
+    logEvent("WiFi offline at boot");
   }
 
   // Enforce strict UTC Timezone 
@@ -124,6 +175,7 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     timeSynced = syncTimeFromNTP();
+    startWebDashboard();
   } else {
     timeSynced = false;
   }
@@ -132,6 +184,8 @@ void setup() {
 }
 
 void loop() {
+  webServer.handleClient();
+
   switch (currentState) {
     case STATE_IDLE: handleIdleState(); break;
     case STATE_KEYPAD: handleKeypadState(); break;
@@ -143,6 +197,27 @@ void handleIdleState() {
   maintainWiFiAndTime();
 
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return;
+
+  activeCardIndex = findWhitelistedCardIndex(mfrc522.uid.uidByte, mfrc522.uid.size);
+  if (activeCardIndex < 0) {
+    Serial.print("Unknown RFID UID: ");
+    printUidHex(mfrc522.uid.uidByte, mfrc522.uid.size);
+    logEvent("Unknown card denied");
+    lcdPrint("Unknown Card", "Access Denied");
+    beep(400);
+    delay(1200);
+    updateIdleLCD();
+    resetRFIDSession();
+    return;
+  }
+
+  Serial.print("Whitelisted RFID UID: ");
+  printUidHex(mfrc522.uid.uidByte, mfrc522.uid.size);
+  {
+    char msg[EVENT_MSG_LEN];
+    snprintf(msg, sizeof(msg), "Card accepted idx=%d", activeCardIndex);
+    logEvent(msg);
+  }
 
   beep(100); 
   
@@ -156,35 +231,76 @@ void handleIdleState() {
     Serial.println((long)now);
     
     // 2. Generate the full 6-digit TOTP code (explicitly cast to 32-bit long)
-    char* fullCode = totp.getCode((long)now);
-    
-    // 3. Store the full 6 digits
-    strncpy(expectedOTP, fullCode, sizeof(expectedOTP) - 1);
-    expectedOTP[sizeof(expectedOTP) - 1] = '\0';
+    if (!getCardTotpCodeAtTime(activeCardIndex, (long)now, expectedOTP, sizeof(expectedOTP))) {
+      Serial.println("Failed to derive per-card TOTP. Falling back to master PIN.");
+      logEvent("Per-card TOTP failed, fallback PIN");
+      strcpy(expectedOTP, masterPIN);
+      lcdPrint("Offline Mode", "Use Master PIN");
+      useTOTPAuth = false;
+      keypadEntryStartMs = millis();
+      currentState = STATE_KEYPAD;
+      resetKeypadInput();
+      resetRFIDSession();
+      return;
+    }
     
     Serial.print("Current Expected 6-Digit Code: ");
     Serial.println(expectedOTP);
+    logEvent("Prompting for card OTP");
     
-    lcdPrint("Check Auth App", "Enter OTP:");
+    lcdPrint("Enter OTP:", "");
     useTOTPAuth = true;
+    lastTotpSecondsShown = 255;
+    updateTotpCountdownDisplay();
   } else {
     strcpy(expectedOTP, masterPIN);
     lcdPrint("Offline Mode", "Use Master PIN");
     useTOTPAuth = false;
+    logEvent("Prompting for master PIN");
   }
   
+  keypadEntryStartMs = millis();
   currentState = STATE_KEYPAD;
   resetKeypadInput();
-  mfrc522.PICC_HaltA(); 
+  resetRFIDSession(); 
 }
 
 void handleKeypadState() {
+  if (millis() - keypadEntryStartMs >= OTP_ENTRY_TIMEOUT_MS) {
+    lcdPrint("OTP Timeout", "Scan Card Again");
+    logEvent("OTP entry timeout");
+    beep(150);
+    delay(1000);
+    resetKeypadInput();
+    activeCardIndex = -1;
+    useTOTPAuth = false;
+    resetRFIDSession();
+    currentState = STATE_IDLE;
+    updateIdleLCD();
+    return;
+  }
+
+  if (useTOTPAuth) {
+    updateTotpCountdownDisplay();
+  }
+  updateKeypadSessionDisplay();
+
   char key = keypad.getKey();
   if (key) {
+    if (!isDigit(key) && key != '*' && key != '#') {
+      return;
+    }
+
     beep(50); 
     if (key == '*' || key == '#') {
       resetKeypadInput();
-      lcdPrint("Enter PIN:", "");
+      if (useTOTPAuth) {
+        lcdPrint("Enter OTP:", "");
+        lastTotpSecondsShown = 255;
+        updateTotpCountdownDisplay();
+      } else {
+        lcdPrint("Enter PIN:", "");
+      }
       return;
     }
     enteredPIN[inputIndex] = key;
@@ -203,12 +319,17 @@ void handleKeypadState() {
       }
 
       if (isAuthorized) {
+        logEvent("PIN/OTP accepted");
         currentState = STATE_UNLOCK;
         justEnteredUnlock = true;
       } else {
+        logEvent("PIN/OTP rejected");
         lcdPrint("Access Denied!", "Wrong PIN");
         beep(500); 
         delay(1500); 
+        activeCardIndex = -1;
+        useTOTPAuth = false;
+        resetRFIDSession();
         currentState = STATE_IDLE;
         updateIdleLCD();
       }
@@ -219,12 +340,18 @@ void handleKeypadState() {
 void handleUnlockState() {
   if (justEnteredUnlock) {
     lcdPrint("Access Granted!", "Door Unlocked.");
+    logEvent("Door unlocked");
+    beep(120);
     doorServo.write(90); 
     unlockStartTime = millis();
     justEnteredUnlock = false;
   }
   if (millis() - unlockStartTime >= UNLOCK_DURATION) {
     doorServo.write(0); 
+    logEvent("Door locked");
+    activeCardIndex = -1;
+    useTOTPAuth = false;
+    resetRFIDSession();
     currentState = STATE_IDLE;
     updateIdleLCD();
   }
@@ -261,14 +388,21 @@ bool syncTimeFromNTP() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 5000)) {
     Serial.println("Failed to obtain time. Falling back to master PIN.");
+    logEvent("Time sync failed");
     return false;
   }
 
   Serial.println("Time synced successfully!");
+  logEvent("Time synced");
   return true;
 }
 
 bool isValidOnlineOTP(const char* pin) {
+  if (activeCardIndex < 0) {
+    Serial.println("No active card selected for OTP validation.");
+    return false;
+  }
+
   time_t now;
   time(&now);
 
@@ -279,34 +413,313 @@ bool isValidOnlineOTP(const char* pin) {
 
   for (int8_t offset = -TOTP_ACCEPT_WINDOW_STEPS; offset <= TOTP_ACCEPT_WINDOW_STEPS; offset++) {
     long candidateTime = (long)now + (offset * TOTP_STEP_SECONDS);
-    char* candidateCode = totp.getCode(candidateTime);
+    char candidateCode[7];
+    if (!getCardTotpCodeAtTime(activeCardIndex, candidateTime, candidateCode, sizeof(candidateCode))) {
+      continue;
+    }
     if (strcmp(pin, candidateCode) == 0) {
       Serial.print("OTP accepted with time-step offset: ");
       Serial.println(offset);
+      logEvent("OTP valid");
       return true;
     }
   }
 
   Serial.println("OTP validation failed for all allowed time windows.");
+  logEvent("OTP invalid");
   return false;
 }
 
 void maintainWiFiAndTime() {
   unsigned long nowMs = millis();
+  static bool wasConnected = false;
 
   if (WiFi.status() != WL_CONNECTED) {
+    wasConnected = false;
     if (nowMs - lastWiFiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
       lastWiFiRetryMs = nowMs;
       Serial.println("WiFi disconnected. Retrying...");
+      logEvent("WiFi reconnect retry");
       WiFi.reconnect();
     }
     return;
   }
 
+  if (!wasConnected) {
+    wasConnected = true;
+    Serial.print("WiFi connected. ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+    logEvent("WiFi connected (runtime)");
+  }
+
   if (!timeSynced && nowMs - lastTimeSyncRetryMs >= TIME_SYNC_RETRY_INTERVAL_MS) {
+    startWebDashboard();
     lastTimeSyncRetryMs = nowMs;
     Serial.println("WiFi restored. Attempting time sync...");
+    logEvent("WiFi restored, syncing time");
     timeSynced = syncTimeFromNTP();
+    if (timeSynced) {
+      startWebDashboard();
+    }
     updateIdleLCD();
+  }
+}
+
+void updateTotpCountdownDisplay() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastTotpLcdRefreshMs < TOTP_LCD_REFRESH_INTERVAL_MS) {
+    return;
+  }
+  lastTotpLcdRefreshMs = nowMs;
+
+  time_t now;
+  time(&now);
+  if (now <= 0) {
+    return;
+  }
+
+  uint8_t secondsRemaining = (uint8_t)(TOTP_STEP_SECONDS - ((long)now % TOTP_STEP_SECONDS));
+  if (secondsRemaining == 0 || secondsRemaining > TOTP_STEP_SECONDS) {
+    secondsRemaining = (uint8_t)TOTP_STEP_SECONDS;
+  }
+
+  if (secondsRemaining == lastTotpSecondsShown) {
+    return;
+  }
+  lastTotpSecondsShown = secondsRemaining;
+
+  lcd.setCursor(13, 0);
+  lcd.print('T');
+  if (secondsRemaining < 10) {
+    lcd.print('0');
+  }
+  lcd.print(secondsRemaining);
+}
+
+void updateKeypadSessionDisplay() {
+  int secondsLeft = getKeypadSecondsRemaining();
+  lcd.setCursor(13, 1);
+  if (secondsLeft < 10) {
+    lcd.print('0');
+  } else {
+    lcd.print(secondsLeft / 10);
+  }
+  lcd.print(secondsLeft % 10);
+  lcd.print('s');
+}
+
+int findWhitelistedCardIndex(const byte* uid, byte uidSize) {
+  if (uidSize != CARD_UID_LEN) {
+    return -1;
+  }
+
+  for (size_t i = 0; i < WHITELIST_COUNT; i++) {
+    if (memcmp(uid, whitelist[i].uid, CARD_UID_LEN) == 0) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+
+bool getCardTotpCodeAtTime(int cardIndex, long unixTime, char* outCode, size_t outCodeSize) {
+  if (cardIndex < 0 || (size_t)cardIndex >= WHITELIST_COUNT || outCodeSize < 7) {
+    return false;
+  }
+
+  uint8_t keyCopy[CARD_SECRET_LEN];
+  memcpy(keyCopy, whitelist[cardIndex].secret, CARD_SECRET_LEN);
+  TOTP cardTotp(keyCopy, CARD_SECRET_LEN);
+  char* code = cardTotp.getCode(unixTime);
+  if (code == nullptr) {
+    return false;
+  }
+
+  strncpy(outCode, code, outCodeSize - 1);
+  outCode[outCodeSize - 1] = '\0';
+  return true;
+}
+
+void printUidHex(const byte* uid, byte uidSize) {
+  for (byte i = 0; i < uidSize; i++) {
+    if (uid[i] < 0x10) {
+      Serial.print('0');
+    }
+    Serial.print(uid[i], HEX);
+    if (i + 1 < uidSize) {
+      Serial.print(':');
+    }
+  }
+  Serial.println();
+}
+
+void logEvent(const char* message) {
+  strncpy(eventLog[eventLogHead], message, EVENT_MSG_LEN - 1);
+  eventLog[eventLogHead][EVENT_MSG_LEN - 1] = '\0';
+  eventLogHead = (eventLogHead + 1) % EVENT_LOG_SIZE;
+  if (eventLogCount < EVENT_LOG_SIZE) {
+    eventLogCount++;
+  }
+}
+
+const char* getStateLabel() {
+  switch (currentState) {
+    case STATE_IDLE: return "IDLE";
+    case STATE_KEYPAD: return "KEYPAD";
+    case STATE_UNLOCK: return "UNLOCK";
+    default: return "UNKNOWN";
+  }
+}
+
+int getTotpSecondsRemaining() {
+  time_t now;
+  time(&now);
+  if (now <= 0) {
+    return -1;
+  }
+  int remaining = (int)(TOTP_STEP_SECONDS - ((long)now % TOTP_STEP_SECONDS));
+  if (remaining <= 0 || remaining > TOTP_STEP_SECONDS) {
+    remaining = (int)TOTP_STEP_SECONDS;
+  }
+  return remaining;
+}
+
+int getKeypadSecondsRemaining() {
+  if (currentState != STATE_KEYPAD) {
+    return 0;
+  }
+  unsigned long elapsed = millis() - keypadEntryStartMs;
+  if (elapsed >= OTP_ENTRY_TIMEOUT_MS) {
+    return 0;
+  }
+  return (int)((OTP_ENTRY_TIMEOUT_MS - elapsed + 999) / 1000);
+}
+
+void startWebDashboard() {
+  static bool started = false;
+  if (started) {
+    return;
+  }
+
+  webServer.on("/", handleWebRoot);
+  webServer.on("/api/status", handleWebStatus);
+  webServer.on("/api/events", handleWebEvents);
+  webServer.on("/action", handleWebAction);
+  webServer.begin();
+  started = true;
+  logEvent("Web dashboard started");
+}
+
+void handleWebRoot() {
+  String html;
+  html.reserve(1800);
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>DoorControl Dashboard</title>";
+  html += "<style>body{font-family:Verdana,sans-serif;background:#f2f4f8;margin:0;padding:20px;}";
+  html += "h1{margin:0 0 12px;} .card{background:#fff;border-radius:10px;padding:14px;margin:10px 0;box-shadow:0 2px 8px rgba(0,0,0,.08);} button{padding:10px 12px;margin:4px;} pre{white-space:pre-wrap;}";
+  html += "</style></head><body>";
+  html += "<h1>DoorControl</h1>";
+  html += "<div class='card'><b>State:</b> ";
+  html += getStateLabel();
+  html += "<br><b>WiFi:</b> ";
+  html += (WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+  html += "<br><b>Time Synced:</b> ";
+  html += (timeSynced ? "Yes" : "No");
+  html += "<br><b>Auth Mode:</b> ";
+  html += (useTOTPAuth ? "Card TOTP" : "Master PIN");
+  html += "<br><b>Active Card Index:</b> ";
+  html += String(activeCardIndex);
+  html += "<br><b>TOTP Sec Left:</b> ";
+  html += String(getTotpSecondsRemaining());
+  html += "<br><b>Keypad Sec Left:</b> ";
+  html += String(getKeypadSecondsRemaining());
+  html += "</div>";
+  html += "<div class='card'><a href='/action?cmd=buzzer'><button>Buzzer Test</button></a>";
+  html += "<a href='/action?cmd=unlock'><button>Unlock Test</button></a>";
+  html += "<a href='/action?cmd=resync'><button>Time Resync</button></a></div>";
+  html += "<div class='card'><b>Whitelisted UIDs</b><pre>";
+  for (size_t i = 0; i < WHITELIST_COUNT; i++) {
+    html += "#";
+    html += String((int)i);
+    html += " ";
+    appendUidToString(html, whitelist[i].uid, CARD_UID_LEN);
+    html += "\n";
+  }
+  html += "</pre></div>";
+  html += "<div class='card'><b>Recent Events</b><pre>";
+  for (int i = 0; i < eventLogCount; i++) {
+    int idx = (eventLogHead + EVENT_LOG_SIZE - eventLogCount + i) % EVENT_LOG_SIZE;
+    html += eventLog[idx];
+    html += "\n";
+  }
+  html += "</pre></div>";
+  html += "<script>setTimeout(()=>location.reload(),";
+  html += String(WEB_STATUS_REFRESH_MS);
+  html += ");</script></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+void handleWebStatus() {
+  String json = "{";
+  json += "\"state\":\"" + String(getStateLabel()) + "\",";
+  json += "\"wifi\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"timeSynced\":" + String(timeSynced ? "true" : "false") + ",";
+  json += "\"authMode\":\"" + String(useTOTPAuth ? "totp" : "master") + "\",";
+  json += "\"activeCardIndex\":" + String(activeCardIndex) + ",";
+  json += "\"totpSecLeft\":" + String(getTotpSecondsRemaining()) + ",";
+  json += "\"keypadSecLeft\":" + String(getKeypadSecondsRemaining()) + ",";
+  json += "\"whitelistCount\":" + String((int)WHITELIST_COUNT);
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleWebEvents() {
+  String body;
+  for (int i = 0; i < eventLogCount; i++) {
+    int idx = (eventLogHead + EVENT_LOG_SIZE - eventLogCount + i) % EVENT_LOG_SIZE;
+    body += eventLog[idx];
+    body += "\n";
+  }
+  webServer.send(200, "text/plain", body);
+}
+
+void handleWebAction() {
+  String cmd = webServer.arg("cmd");
+  if (cmd == "buzzer") {
+    beep(150);
+    logEvent("Web action: buzzer");
+  } else if (cmd == "unlock") {
+    doorServo.write(90);
+    delay(500);
+    doorServo.write(0);
+    logEvent("Web action: unlock test");
+  } else if (cmd == "resync") {
+    if (WiFi.status() == WL_CONNECTED) {
+      timeSynced = syncTimeFromNTP();
+      updateIdleLCD();
+      logEvent("Web action: time resync");
+    }
+  }
+
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void resetRFIDSession() {
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+void appendUidToString(String& out, const byte* uid, byte uidSize) {
+  for (byte i = 0; i < uidSize; i++) {
+    if (uid[i] < 0x10) {
+      out += '0';
+    }
+    out += String(uid[i], HEX);
+    if (i + 1 < uidSize) {
+      out += ':';
+    }
   }
 }
