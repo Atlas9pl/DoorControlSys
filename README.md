@@ -3,4 +3,4 @@
 
 # To-do
 
-Remove Buzzer and code for it
+N/A
