@@ -41,6 +41,11 @@ const int BUZZER_PIN = 33;
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 0; // TOTP ALWAYS uses UTC time (0 offset)
 const int   daylightOffset_sec = 0;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
+const unsigned long TIME_SYNC_RETRY_INTERVAL_MS = 60000;
+const long TOTP_STEP_SECONDS = 30;
+const int8_t TOTP_ACCEPT_WINDOW_STEPS = 1;
 
 // The Hex equivalent of the Base32 secret "GEZDGNBVGY3TQOJQ"
 uint8_t hmacKey[] = {0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30};
@@ -49,8 +54,8 @@ TOTP totp = TOTP(hmacKey, 10);
 enum SystemState { STATE_IDLE, STATE_KEYPAD, STATE_UNLOCK };
 SystemState currentState = STATE_IDLE;
 
-const char* ssid = "YOUR_WIFI_NAME"; 
-const char* password = "YOUR_WIFI_PASSWORD";
+const char* ssid = "Atlas"; 
+const char* password = "Zappy454";
 
 // EXPECTS 6 DIGITS (7 characters including null terminator)
 char expectedOTP[7] = "000000";       
@@ -61,6 +66,10 @@ byte inputIndex = 0;
 unsigned long unlockStartTime = 0;
 const unsigned long UNLOCK_DURATION = 5000;
 bool justEnteredUnlock = false;
+bool timeSynced = false;
+bool useTOTPAuth = false;
+unsigned long lastWiFiRetryMs = 0;
+unsigned long lastTimeSyncRetryMs = 0;
 
 // ==========================================
 // FUNCTION PROTOTYPES (CRITICAL FOR PLATFORMIO)
@@ -72,6 +81,9 @@ void lcdPrint(const char* line1, const char* line2);
 void updateIdleLCD();
 void resetKeypadInput();
 void beep(int duration);
+bool syncTimeFromNTP();
+bool isValidOnlineOTP(const char* pin);
+void maintainWiFiAndTime();
 
 // ==========================================
 // SETUP
@@ -82,6 +94,7 @@ void setup() {
   
   SPI.begin();
   mfrc522.PCD_Init();
+  mfrc522.PCD_DumpVersionToSerial();
   lcd.begin(16, 2);
   
   ESP32PWM::allocateTimer(0);
@@ -94,24 +107,25 @@ void setup() {
   
   lcdPrint("Connecting to", "WiFi...");
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS)) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi Connected!");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+  } else {
+    Serial.println("\nWiFi not connected. Continuing in offline mode.");
+  }
 
   // Enforce strict UTC Timezone 
   setenv("TZ", "UTC0", 1);
   tzset();
 
-  // Sync atomic time for TOTP
-  lcdPrint("Syncing Time...", "");
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    Serial.println("Failed to obtain time");
+  if (WiFi.status() == WL_CONNECTED) {
+    timeSynced = syncTimeFromNTP();
   } else {
-    Serial.println("Time synced successfully!");
+    timeSynced = false;
   }
   
   updateIdleLCD();
@@ -126,11 +140,13 @@ void loop() {
 }
 
 void handleIdleState() {
+  maintainWiFiAndTime();
+
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return;
 
   beep(100); 
   
-  if (WiFi.status() == WL_CONNECTED) {
+  if (timeSynced) {
     // 1. Get current UTC Time
     time_t now;
     time(&now);
@@ -143,15 +159,18 @@ void handleIdleState() {
     char* fullCode = totp.getCode((long)now);
     
     // 3. Store the full 6 digits
-    strcpy(expectedOTP, fullCode);
+    strncpy(expectedOTP, fullCode, sizeof(expectedOTP) - 1);
+    expectedOTP[sizeof(expectedOTP) - 1] = '\0';
     
     Serial.print("Current Expected 6-Digit Code: ");
     Serial.println(expectedOTP);
     
     lcdPrint("Check Auth App", "Enter OTP:");
+    useTOTPAuth = true;
   } else {
     strcpy(expectedOTP, masterPIN);
-    lcdPrint("Offline Mode", "Enter Master PIN");
+    lcdPrint("Offline Mode", "Use Master PIN");
+    useTOTPAuth = false;
   }
   
   currentState = STATE_KEYPAD;
@@ -176,7 +195,14 @@ void handleKeypadState() {
 
     // NOW WAITS FOR 6 DIGITS
     if (inputIndex == 6) {
-      if (strcmp(enteredPIN, expectedOTP) == 0) {
+      bool isAuthorized = false;
+      if (useTOTPAuth) {
+        isAuthorized = isValidOnlineOTP(enteredPIN);
+      } else {
+        isAuthorized = (strcmp(enteredPIN, expectedOTP) == 0);
+      }
+
+      if (isAuthorized) {
         currentState = STATE_UNLOCK;
         justEnteredUnlock = true;
       } else {
@@ -213,8 +239,8 @@ void lcdPrint(const char* line1, const char* line2) {
 }
 
 void updateIdleLCD() {
-  if (WiFi.status() == WL_CONNECTED) lcdPrint("Scan ID Card", "[Auth: TOTP]");
-  else lcdPrint("Scan ID Card", "[Auth: Offline]");
+  if (timeSynced) lcdPrint("Scan ID Card", "[Auth: TOTP]");
+  else lcdPrint("Scan ID Card", "[Auth: Master]");
 }
 
 void resetKeypadInput() {
@@ -226,4 +252,61 @@ void beep(int duration) {
   digitalWrite(BUZZER_PIN, HIGH); 
   delay(duration); 
   digitalWrite(BUZZER_PIN, LOW);
+}
+
+bool syncTimeFromNTP() {
+  lcdPrint("Syncing Time...", "");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 5000)) {
+    Serial.println("Failed to obtain time. Falling back to master PIN.");
+    return false;
+  }
+
+  Serial.println("Time synced successfully!");
+  return true;
+}
+
+bool isValidOnlineOTP(const char* pin) {
+  time_t now;
+  time(&now);
+
+  if (now <= 0) {
+    Serial.println("Invalid system time. Rejecting OTP.");
+    return false;
+  }
+
+  for (int8_t offset = -TOTP_ACCEPT_WINDOW_STEPS; offset <= TOTP_ACCEPT_WINDOW_STEPS; offset++) {
+    long candidateTime = (long)now + (offset * TOTP_STEP_SECONDS);
+    char* candidateCode = totp.getCode(candidateTime);
+    if (strcmp(pin, candidateCode) == 0) {
+      Serial.print("OTP accepted with time-step offset: ");
+      Serial.println(offset);
+      return true;
+    }
+  }
+
+  Serial.println("OTP validation failed for all allowed time windows.");
+  return false;
+}
+
+void maintainWiFiAndTime() {
+  unsigned long nowMs = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (nowMs - lastWiFiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
+      lastWiFiRetryMs = nowMs;
+      Serial.println("WiFi disconnected. Retrying...");
+      WiFi.reconnect();
+    }
+    return;
+  }
+
+  if (!timeSynced && nowMs - lastTimeSyncRetryMs >= TIME_SYNC_RETRY_INTERVAL_MS) {
+    lastTimeSyncRetryMs = nowMs;
+    Serial.println("WiFi restored. Attempting time sync...");
+    timeSynced = syncTimeFromNTP();
+    updateIdleLCD();
+  }
 }
