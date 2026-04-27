@@ -10,11 +10,12 @@
 #include <TOTP.h> 
 
 // ==========================================
-// PIN DEFINITIONS & HARDWARE SETUP
+// PINOUT & HARDWARE
 // ==========================================
 
 #define SS_PIN  5
-#define RST_PIN 255 // 255 tells the library this pin is unused (Hardwired to 3.3V)
+#define RST_PIN 255 // The library is too stupid to realize I've hardwired this to 3.3V. 
+                    // Pass 255 to keep it from trying to toggle a pin that doesn't exist.
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
 LiquidCrystal lcd(22, 21, 17, 16, 2, 15);
@@ -28,7 +29,9 @@ char keys[ROWS][COLS] = {
   {'*','0','#','D'}
 };
 byte rowPins[ROWS] = {13, 12, 14, 27};
-// WARNING: GPIO0 affects boot mode on ESP32. Ensure proper pull state in hardware.
+// WARNING: GPIO0 is a physical landmine. If someone holds the button down while 
+// plugging this in, the ESP32 enters bootloader mode and we look like idiots 
+// because the 'high tech' lock won't start.
 byte colPins[COLS] = {26, 25, 4, 0};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
@@ -38,16 +41,18 @@ Servo doorServo;
 const int BUZZER_PIN = 33;
 
 // ==========================================
-// TOTP & TIME CONFIGURATION
+// TOTP & TIME
 // ==========================================
-const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 0; // TOTP ALWAYS uses UTC time (0 offset)
+const char* ntpServer = "pool.ntp.org"; // I could have used the german server... I didn't... I don't care enough 
+const long  gmtOffset_sec = 0; // TOTP has to use UTC time
 const int   daylightOffset_sec = 0;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 30000; // This doesn't feel real, I don't know why, the ESP32 is frying my brain
 const unsigned long TIME_SYNC_RETRY_INTERVAL_MS = 60000;
 const long TOTP_STEP_SECONDS = 30;
-const int8_t TOTP_ACCEPT_WINDOW_STEPS = 1;
+const int8_t TOTP_ACCEPT_WINDOW_STEPS = 1; // I don't know why, and I don't want to know why, but the NTP sync is 
+                                           // perpetually drifting. We're checking +/- 30 seconds so users don't 
+                                           // get locked out by the literal fabric of time.
 const unsigned long TOTP_LCD_REFRESH_INTERVAL_MS = 250;
 const unsigned long OTP_ENTRY_TIMEOUT_MS = 60000;
 const unsigned long WEB_STATUS_REFRESH_MS = 2000;
@@ -60,7 +65,7 @@ struct CardProfile {
 const size_t CARD_UID_LEN = 4;
 const size_t CARD_SECRET_LEN = 10;
 
-// Pre-generated whitelist and per-card TOTP secrets.
+// Whitelist for Users, yeah it isn't pretty, it isn't safe, but it works... If you're reading this it's too late anyway...
 const CardProfile whitelist[] = {
   {{0x9A, 0x89, 0x89, 0x81}, {0x31, 0x41, 0x73, 0x58, 0x39, 0x50, 0x62, 0x4B, 0x37, 0x51}},
   {{0x45, 0xDC, 0x9A, 0x03}, {0x32, 0x4D, 0x68, 0x59, 0x38, 0x4E, 0x74, 0x43, 0x36, 0x57}},
@@ -80,7 +85,8 @@ WebServer webServer(80);
 
 // EXPECTS 6 DIGITS (7 characters including null terminator)
 char expectedOTP[7] = "000000";       
-const char masterPIN[7] = "123456";   
+const char masterPIN[7] = "123456"; // Abandoning all security concepts because the Access Points are garbage. 
+                                    // Using the '123456' PIN like it's the Minuteman launch codes. God help us.  
 char enteredPIN[7];                 
 byte inputIndex = 0;
 
@@ -103,7 +109,7 @@ uint8_t eventLogHead = 0;
 uint8_t eventLogCount = 0;
 
 // ==========================================
-// FUNCTION PROTOTYPES (CRITICAL FOR PLATFORMIO)
+// FUNCTION PROTOTYPES, CRITICAL FOR PLATFORMIO BECAUSE IT'S A MEDICORE PRODUCT
 // ==========================================
 void handleIdleState();
 void handleKeypadState();
@@ -150,7 +156,8 @@ void setup() {
   doorServo.write(0); 
   
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW); // THIS CODE IS BULLSHIT AND TAKES UP MEMORY BECAUSE THE PASSIVE BUZZER SUCKS AND DOESNT WORK!
+                                 // I should probably remove this...
   
   lcdPrint("Connecting to", "WiFi...");
   WiFi.begin(ssid, password);
@@ -165,12 +172,12 @@ void setup() {
     Serial.println(WiFi.localIP());
     logEvent("WiFi connected");
   } else {
-    Serial.println("\nWiFi not connected. Continuing in offline mode.");
+    Serial.println("\nWiFi not connected. Continuing in offline mode."); // My literal nightmare
     logEvent("WiFi offline at boot");
   }
 
-  // Enforce strict UTC Timezone 
-  setenv("TZ", "UTC0", 1);
+  // Enforce UTC Timezone 
+  setenv("TZ", "UTC0", 1); // Because if we didn't, the ESP32 will shit itself and select Russia as it's timezone...
   tzset();
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -222,20 +229,20 @@ void handleIdleState() {
   beep(100); 
   
   if (timeSynced) {
-    // 1. Get current UTC Time
+    // Get current UTC Time
     time_t now;
     time(&now);
     
     // DEBUG: Print the Unix Timestamp
-    Serial.print("Current UTC Unix Time: ");
+    Serial.print("Current UTC Unix Time: "); // Because either the library or the esp32 suck with syncing via internal RTC... fuck this shit
     Serial.println((long)now);
     
-    // 2. Generate the full 6-digit TOTP code (explicitly cast to 32-bit long)
+    // Generate full 6-digit TOTP code (explicitly cast to 32-bit long)
     if (!getCardTotpCodeAtTime(activeCardIndex, (long)now, expectedOTP, sizeof(expectedOTP))) {
-      Serial.println("Failed to derive per-card TOTP. Falling back to master PIN.");
+      Serial.println("Failed to derive per-card TOTP. Falling back to master PIN."); // HOLY FUCKING SHIT THE WIFI IS GONE. 
       logEvent("Per-card TOTP failed, fallback PIN");
       strcpy(expectedOTP, masterPIN);
-      lcdPrint("Offline Mode", "Use Master PIN");
+      lcdPrint("Offline Mode", "Use Master PIN"); // We are officially giving up on security because the WiFi died. This is utterly fucking retarded, but it's better than the project not working because the ISP is having a stroke.
       useTOTPAuth = false;
       keypadEntryStartMs = millis();
       currentState = STATE_KEYPAD;
@@ -309,7 +316,7 @@ void handleKeypadState() {
     lcd.print('*'); 
     inputIndex++;
 
-    // NOW WAITS FOR 6 DIGITS
+    // WAITS FOR 6 DIGITS
     if (inputIndex == 6) {
       bool isAuthorized = false;
       if (useTOTPAuth) {
@@ -367,7 +374,7 @@ void lcdPrint(const char* line1, const char* line2) {
 
 void updateIdleLCD() {
   if (timeSynced) lcdPrint("Scan ID Card", "[Auth: TOTP]");
-  else lcdPrint("Scan ID Card", "[Auth: Master]");
+  else lcdPrint("Scan ID Card", "[Auth: Master]"); // Don't we use main instead of master now... eh fuck it
 }
 
 void resetKeypadInput() {
@@ -612,7 +619,9 @@ void startWebDashboard() {
 
 void handleWebRoot() {
   String html;
-  html.reserve(1800);
+  html.reserve(1800); // Clear that motherfucker out. If I don't reserve this memory upfront, 
+                      // the heap fragments into a million pieces and the ESP32 shits itself 
+                      // after three page refreshes.
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>DoorControl Dashboard</title>";
