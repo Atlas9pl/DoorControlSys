@@ -39,10 +39,9 @@ const int SERVO_PIN = 32;
 Servo doorServo;
 
 const int BUZZER_PIN = 33;
-
-// ==========================================
-// TOTP & TIME
-// ==========================================
+const int BUZZER_CHANNEL = 0;
+const int BUZZER_FREQUENCY = 2000; // Hz - typical passive buzzer resonance
+const int BUZZER_RESOLUTION = 8; // bits (0-255)
 const char* ntpServer = "pool.ntp.org"; // I could have used the german server... I didn't... I don't care enough 
 const long  gmtOffset_sec = 0; // TOTP has to use UTC time
 const int   daylightOffset_sec = 0;
@@ -156,8 +155,11 @@ void setup() {
   doorServo.write(0); 
   
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW); // THIS CODE IS BULLSHIT AND TAKES UP MEMORY BECAUSE THE PASSIVE BUZZER SUCKS AND DOESNT WORK!
-                                 // I should probably remove this...
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Configure PWM for passive buzzer
+  ledcSetup(BUZZER_CHANNEL, BUZZER_FREQUENCY, BUZZER_RESOLUTION);
+  ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL); // This might work now... flash it and pray it does
   
   lcdPrint("Connecting to", "WiFi...");
   WiFi.begin(ssid, password);
@@ -383,9 +385,10 @@ void resetKeypadInput() {
 }
 
 void beep(int duration) {
-  digitalWrite(BUZZER_PIN, HIGH); 
-  delay(duration); 
-  digitalWrite(BUZZER_PIN, LOW);
+  // Drive passive buzzer with PWM tone
+  ledcWrite(BUZZER_CHANNEL, 128); // 50% duty cycle
+  delay(duration);
+  ledcWrite(BUZZER_CHANNEL, 0); // Stop tone
 }
 
 bool syncTimeFromNTP() {
