@@ -97,9 +97,11 @@ unsigned long unlockStartTime = 0;
 const unsigned long UNLOCK_DURATION = 5000;
 bool justEnteredUnlock = false;
 bool timeSynced = false;
+bool timeSyncRequested = false;
 bool useTOTPAuth = false;
 unsigned long lastWiFiRetryMs = 0;
 unsigned long lastTimeSyncRetryMs = 0;
+unsigned long timeSyncRequestMs = 0;
 unsigned long lastTotpLcdRefreshMs = 0;
 uint8_t lastTotpSecondsShown = 255;
 int activeCardIndex = -1;
@@ -126,6 +128,8 @@ void updateIdleLCD();
 void resetKeypadInput();
 void beep(int duration);
 bool syncTimeFromNTP();
+void requestTimeSync();
+bool waitForSystemTimeSync(unsigned long timeoutMs);
 bool isSystemTimeValid();
 bool isValidOnlineOTP(const char* pin);
 void maintainWiFiAndTime();
@@ -193,7 +197,16 @@ void setup() {
   tzset();
 
   if (WiFi.status() == WL_CONNECTED) {
-    timeSynced = syncTimeFromNTP();
+    requestTimeSync();
+    timeSynced = waitForSystemTimeSync(5000);
+    timeSyncRequested = false;
+    if (timeSynced) {
+      Serial.println("Time synced successfully!");
+      logEvent("Time synced");
+    } else {
+      Serial.println("Boot time sync not ready yet; staying in master mode for now.");
+      logEvent("Boot time sync pending");
+    }
     startWebDashboard();
   } else {
     timeSynced = false;
@@ -418,6 +431,23 @@ bool syncTimeFromNTP() {
   return isSystemTimeValid();
 }
 
+void requestTimeSync() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  timeSyncRequested = true;
+  timeSyncRequestMs = millis();
+}
+
+bool waitForSystemTimeSync(unsigned long timeoutMs) {
+  unsigned long startedMs = millis();
+  while (millis() - startedMs < timeoutMs) {
+    if (isSystemTimeValid()) {
+      return true;
+    }
+    delay(100);
+  }
+  return isSystemTimeValid();
+}
+
 bool isSystemTimeValid() {
   time_t now;
   time(&now);
@@ -479,6 +509,7 @@ void maintainWiFiAndTime() {
       Serial.println("WiFi disconnected; marking timeSynced = false");
       logEvent("WiFi disconnected; time unsynced");
     }
+    timeSyncRequested = false;
 
     // Do not spend foreground time trying to recover networking while a user is
     // actively interacting with RFID or the keypad. Keep the fucking thing working 
@@ -502,23 +533,27 @@ void maintainWiFiAndTime() {
     logEvent("WiFi connected (runtime)");
   }
 
-  if (!timeSynced && nowMs - lastTimeSyncRetryMs >= TIME_SYNC_RETRY_INTERVAL_MS) {
+  if (!timeSynced && !timeSyncRequested && nowMs - lastTimeSyncRetryMs >= TIME_SYNC_RETRY_INTERVAL_MS) {
     lastTimeSyncRetryMs = nowMs;
     Serial.println("WiFi restored. Attempting time sync...");
     logEvent("WiFi restored, syncing time");
     if (WiFi.status() == WL_CONNECTED) {
       lcdPrint("Syncing Time...", "");
+      requestTimeSync();
     }
-    timeSynced = syncTimeFromNTP();
-    if (timeSynced) {
-      Serial.println("Time synced successfully!");
-      logEvent("Time synced");
-      startWebDashboard();
-    } else {
-      Serial.println("Time not ready yet; will keep polling in background.");
-      logEvent("Time sync pending");
-    }
+  }
+
+  if (!timeSynced && timeSyncRequested && isSystemTimeValid()) {
+    timeSynced = true;
+    timeSyncRequested = false;
+    Serial.println("Time synced successfully!");
+    logEvent("Time synced");
+    startWebDashboard();
     updateIdleLCD();
+  } else if (!timeSynced && timeSyncRequested && (nowMs - timeSyncRequestMs > TIME_SYNC_RETRY_INTERVAL_MS)) {
+    timeSyncRequested = false;
+    Serial.println("Time sync still pending; will retry later.");
+    logEvent("Time sync pending");
   }
 }
 
@@ -756,9 +791,15 @@ void handleWebAction() {
     logEvent("Web action: unlock test");
   } else if (cmd == "resync") {
     if (WiFi.status() == WL_CONNECTED) {
-      timeSynced = syncTimeFromNTP();
+      requestTimeSync();
+      timeSynced = waitForSystemTimeSync(5000);
+      timeSyncRequested = false;
       updateIdleLCD();
-      logEvent("Web action: time resync");
+      if (timeSynced) {
+        logEvent("Web action: time resync");
+      } else {
+        logEvent("Web action: time resync pending");
+      }
     }
   }
 
