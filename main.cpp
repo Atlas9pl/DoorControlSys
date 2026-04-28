@@ -39,7 +39,11 @@ const int SERVO_PIN = 32;
 Servo doorServo;
 
 const int BUZZER_PIN = 33;
-const int BUZZER_CHANNEL = 0;
+// Hate. Let me tell you how much I've come to hate servos and motors since I began this project. 
+// There are 387.44 million miles of code in wafer thin layers that fill this project.
+// If the word 'hate' was engraved on each nanoangstrom of those hundreds of millions of miles 
+// it would not equal one one-billionth of the hate I feel for ESP32s at this micro-instant. For them. Hate. Hate
+const int BUZZER_CHANNEL = 4;
 const int BUZZER_FREQUENCY = 2000; // Hz - typical passive buzzer resonance
 const int BUZZER_RESOLUTION = 8; // bits (0-255)
 const char* ntpServer = "pool.ntp.org"; // I could have used the german server... I didn't... I don't care enough 
