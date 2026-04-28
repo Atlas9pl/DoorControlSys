@@ -100,6 +100,10 @@ unsigned long lastTotpLcdRefreshMs = 0;
 uint8_t lastTotpSecondsShown = 255;
 int activeCardIndex = -1;
 unsigned long keypadEntryStartMs = 0;
+// Session-scoped TOTP anchors to survive transient WiFi loss
+bool sessionTimeSynced = false;
+time_t sessionScanTime = 0;
+char sessionExpectedOTP[7] = "000000";
 
 const uint8_t EVENT_LOG_SIZE = 20;
 const uint8_t EVENT_MSG_LEN = 64;
@@ -118,10 +122,12 @@ void updateIdleLCD();
 void resetKeypadInput();
 void beep(int duration);
 bool syncTimeFromNTP();
+bool isSystemTimeValid();
 bool isValidOnlineOTP(const char* pin);
 void maintainWiFiAndTime();
 void updateTotpCountdownDisplay();
 void updateKeypadSessionDisplay();
+void stopBuzzer();
 int findWhitelistedCardIndex(const byte* uid, byte uidSize);
 bool getCardTotpCodeAtTime(int cardIndex, long unixTime, char* outCode, size_t outCodeSize);
 void printUidHex(const byte* uid, byte uidSize);
@@ -240,7 +246,7 @@ void handleIdleState() {
     Serial.println((long)now);
     
     // Generate full 6-digit TOTP code (explicitly cast to 32-bit long)
-    if (!getCardTotpCodeAtTime(activeCardIndex, (long)now, expectedOTP, sizeof(expectedOTP))) {
+    if (!getCardTotpCodeAtTime(activeCardIndex, (long)now, sessionExpectedOTP, sizeof(sessionExpectedOTP))) {
       Serial.println("Failed to derive per-card TOTP. Falling back to master PIN."); // HOLY FUCKING SHIT THE WIFI IS GONE. 
       logEvent("Per-card TOTP failed, fallback PIN");
       strcpy(expectedOTP, masterPIN);
@@ -252,9 +258,13 @@ void handleIdleState() {
       resetRFIDSession();
       return;
     }
+    // Anchor session to the scan time so losing WiFi to the Universe's cruelty doesn't break shit
+    sessionTimeSynced = true;
+    sessionScanTime = now;
+    strncpy(expectedOTP, sessionExpectedOTP, sizeof(expectedOTP));
     
-    Serial.print("Current Expected 6-Digit Code: ");
-    Serial.println(expectedOTP);
+    Serial.print("Current Expected 6-Digit Code (anchored at scan): ");
+    Serial.println(sessionExpectedOTP);
     logEvent("Prompting for card OTP");
     
     lcdPrint("Enter OTP:", "");
@@ -265,6 +275,8 @@ void handleIdleState() {
     strcpy(expectedOTP, masterPIN);
     lcdPrint("Offline Mode", "Use Master PIN");
     useTOTPAuth = false;
+    sessionTimeSynced = false;
+    sessionScanTime = 0;
     logEvent("Prompting for master PIN");
   }
   
@@ -283,6 +295,7 @@ void handleKeypadState() {
     resetKeypadInput();
     activeCardIndex = -1;
     useTOTPAuth = false;
+    stopBuzzer();
     resetRFIDSession();
     currentState = STATE_IDLE;
     updateIdleLCD();
@@ -338,6 +351,7 @@ void handleKeypadState() {
         delay(1500); 
         activeCardIndex = -1;
         useTOTPAuth = false;
+        stopBuzzer();
         resetRFIDSession();
         currentState = STATE_IDLE;
         updateIdleLCD();
@@ -360,6 +374,7 @@ void handleUnlockState() {
     logEvent("Door locked");
     activeCardIndex = -1;
     useTOTPAuth = false;
+    stopBuzzer();
     resetRFIDSession();
     currentState = STATE_IDLE;
     updateIdleLCD();
@@ -385,26 +400,24 @@ void resetKeypadInput() {
 }
 
 void beep(int duration) {
-  // Drive passive buzzer with PWM tone
+  // Drive passive buzzer with PWM tone, because I totally did not forget the first time!
   ledcWrite(BUZZER_CHANNEL, 128); // 50% duty cycle
   delay(duration);
   ledcWrite(BUZZER_CHANNEL, 0); // Stop tone
 }
 
 bool syncTimeFromNTP() {
-  lcdPrint("Syncing Time...", "");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 5000)) {
-    Serial.println("Failed to obtain time. Falling back to master PIN.");
-    logEvent("Time sync failed");
-    return false;
-  }
+  // SNTP runs in the background. Treat the sync as successful only once the
+  // system clock has moved into a plausible Unix epoch. Otherwise shit hits the fan!
+  return isSystemTimeValid();
+}
 
-  Serial.println("Time synced successfully!");
-  logEvent("Time synced");
-  return true;
+bool isSystemTimeValid() {
+  time_t now;
+  time(&now);
+  return now > 1700000000;
 }
 
 bool isValidOnlineOTP(const char* pin) {
@@ -421,8 +434,15 @@ bool isValidOnlineOTP(const char* pin) {
     return false;
   }
 
+  // Prefer using the session-anchored scan time if available so losing WiFi to german ISPs
+  // during entry doesn't fuck authentication or invalidate my will to live...
+  time_t baseTime = now;
+  if (sessionTimeSynced && sessionScanTime > 0) {
+    baseTime = sessionScanTime;
+  }
+
   for (int8_t offset = -TOTP_ACCEPT_WINDOW_STEPS; offset <= TOTP_ACCEPT_WINDOW_STEPS; offset++) {
-    long candidateTime = (long)now + (offset * TOTP_STEP_SECONDS);
+    long candidateTime = (long)baseTime + (offset * TOTP_STEP_SECONDS);
     char candidateCode[7];
     if (!getCardTotpCodeAtTime(activeCardIndex, candidateTime, candidateCode, sizeof(candidateCode))) {
       continue;
@@ -446,6 +466,22 @@ void maintainWiFiAndTime() {
 
   if (WiFi.status() != WL_CONNECTED) {
     wasConnected = false;
+    // Mark runtime time sync as unavailable while disconnected. Keep session anchors
+    // so an in-progress keypad/TOTP session can still validate against the
+    // scan-anchored time. This is hacky, but it will have to work! I would not be
+    // surprised if this caused a memory leak...
+    if (timeSynced) {
+      timeSynced = false;
+      Serial.println("WiFi disconnected; marking timeSynced = false");
+      logEvent("WiFi disconnected; time unsynced");
+    }
+
+    // Do not spend foreground time trying to recover networking while a user is
+    // actively interacting with RFID or the keypad. Keep the fucking thing working 
+    if (currentState != STATE_IDLE) {
+      return;
+    }
+
     if (nowMs - lastWiFiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
       lastWiFiRetryMs = nowMs;
       Serial.println("WiFi disconnected. Retrying...");
@@ -463,13 +499,20 @@ void maintainWiFiAndTime() {
   }
 
   if (!timeSynced && nowMs - lastTimeSyncRetryMs >= TIME_SYNC_RETRY_INTERVAL_MS) {
-    startWebDashboard();
     lastTimeSyncRetryMs = nowMs;
     Serial.println("WiFi restored. Attempting time sync...");
     logEvent("WiFi restored, syncing time");
+    if (WiFi.status() == WL_CONNECTED) {
+      lcdPrint("Syncing Time...", "");
+    }
     timeSynced = syncTimeFromNTP();
     if (timeSynced) {
+      Serial.println("Time synced successfully!");
+      logEvent("Time synced");
       startWebDashboard();
+    } else {
+      Serial.println("Time not ready yet; will keep polling in background.");
+      logEvent("Time sync pending");
     }
     updateIdleLCD();
   }
@@ -720,8 +763,16 @@ void handleWebAction() {
 }
 
 void resetRFIDSession() {
+  stopBuzzer();
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
+}
+
+void stopBuzzer() {
+  // Ensure PWM is stopped and pin is low, otherwise it sounds like
+  // the heartbeat to my will to live... 
+  ledcWrite(BUZZER_CHANNEL, 0);
+  digitalWrite(BUZZER_PIN, LOW);
 }
 
 void appendUidToString(String& out, const byte* uid, byte uidSize) {
