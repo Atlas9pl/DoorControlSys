@@ -179,6 +179,8 @@ void setup() {
   mfrc522.PCD_Init();
   mfrc522.PCD_DumpVersionToSerial();
   lcd.begin(16, 2);
+  keypad.setDebounceTime(25);
+  keypad.setHoldTime(500);
   
   ESP32PWM::allocateTimer(0);
   doorServo.setPeriodHertz(50);
@@ -396,16 +398,23 @@ void handleKeypadState() {
 
 void handleUnlockState() {
   if (justEnteredUnlock) {
-    lcdPrint("Access Granted!", "Door Unlocked.");
+    lcdPrint("Access Granted!", "Press 0 to close");
     logEvent("Door unlocked");
     beep(120);
     servoWrite(-180);
-    unlockStartTime = millis();
     justEnteredUnlock = false;
   }
-  if (millis() - unlockStartTime >= UNLOCK_DURATION) {
+  
+  // Listen for 'D' keypress to close the door
+  char key = keypad.getKey();
+  if (key) {
+    Serial.print("Unlock state key: ");
+    Serial.println(key);
+  }
+  if (key == '0') {
     servoWrite(0);
     logEvent("Door locked");
+    lcdPrint("Door Closed", "");
     activeCardIndex = -1;
     useTOTPAuth = false;
     stopBuzzer();
@@ -802,9 +811,7 @@ void handleWebAction() {
     beep(150);
     logEvent("Web action: buzzer");
   } else if (cmd == "unlock") {
-    servoWrite(0);
-    delay(500);
-    servoWrite(90);
+    servoWrite(-180);
     logEvent("Web action: unlock test");
   } else if (cmd == "resync") {
     if (WiFi.status() == WL_CONNECTED) {
