@@ -151,9 +151,26 @@ int getKeypadSecondsRemaining();
 void appendUidToString(String& out, const byte* uid, byte uidSize);
 void resetRFIDSession();
 
+// Servo rotation adjustment helper (handles base rotation offset)
+int servoAdjustedAngle(int angle);
+void servoWrite(int angle);
+
 // ==========================================
 // SETUP
 // ==========================================
+
+// Implementation: compute adjusted servo angle applying a base rotation offset.
+// This lets us compensate when the servo is mounted rotated by 180°.
+int servoAdjustedAngle(int angle) {
+  const int SERVO_BASE_ROTATION_OFFSET = 180; // degrees
+  int adjusted = (angle + SERVO_BASE_ROTATION_OFFSET) % 360;
+  if (adjusted > 180) adjusted = 360 - adjusted;
+  return adjusted;
+}
+
+void servoWrite(int angle) {
+  doorServo.write(servoAdjustedAngle(angle));
+}
 
 void setup() {
   Serial.begin(115200);
@@ -166,7 +183,7 @@ void setup() {
   ESP32PWM::allocateTimer(0);
   doorServo.setPeriodHertz(50);
   doorServo.attach(SERVO_PIN, 500, 2400);
-  doorServo.write(0); 
+  servoWrite(0); 
   
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
@@ -267,7 +284,7 @@ void handleIdleState() {
       Serial.println("Failed to derive per-card TOTP. Falling back to master PIN."); // HOLY FUCKING SHIT THE WIFI IS GONE. 
       logEvent("Per-card TOTP failed, fallback PIN");
       strcpy(expectedOTP, masterPIN);
-      lcdPrint("Offline Mode", "Use Master PIN"); // We are officially giving up on security because the WiFi died. This is utterly fucking retarded, but it's better than the project not working because the ISP is having a stroke.
+      lcdPrint("Offline Mode", "Master PIN"); // We are officially giving up on security because the WiFi died. This is utterly fucking retarded, but it's better than the project not working because the ISP is having a stroke.
       useTOTPAuth = false;
       keypadEntryStartMs = millis();
       currentState = STATE_KEYPAD;
@@ -382,12 +399,12 @@ void handleUnlockState() {
     lcdPrint("Access Granted!", "Door Unlocked.");
     logEvent("Door unlocked");
     beep(120);
-    doorServo.write(90); 
+    servoWrite(-180);
     unlockStartTime = millis();
     justEnteredUnlock = false;
   }
   if (millis() - unlockStartTime >= UNLOCK_DURATION) {
-    doorServo.write(0); 
+    servoWrite(0);
     logEvent("Door locked");
     activeCardIndex = -1;
     useTOTPAuth = false;
@@ -785,9 +802,9 @@ void handleWebAction() {
     beep(150);
     logEvent("Web action: buzzer");
   } else if (cmd == "unlock") {
-    doorServo.write(90);
+    servoWrite(0);
     delay(500);
-    doorServo.write(0);
+    servoWrite(90);
     logEvent("Web action: unlock test");
   } else if (cmd == "resync") {
     if (WiFi.status() == WL_CONNECTED) {
